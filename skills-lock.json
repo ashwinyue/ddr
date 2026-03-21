@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "manga-drama": {
+      "source": "freestylefly/canghe-skills",
+      "sourceType": "github",
+      "computedHash": "1d0360c29651619ce53230fcd2c97252610f97ed0b31cf74d55b9ae1652e7049"
+    },
+    "skill-creator": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "computedHash": "b122f4d1e91aa1d83027e050b5b37c3156203ee85458d7b1360bc48167c9e02a"
+    }
+  }
+}
