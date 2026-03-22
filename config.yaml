@@ -29,6 +29,7 @@ models:
     max_tokens: 8192
     supports_vision: true
     supports_thinking: true
+    timeout: 600  # 单次 API 请求超时 600 秒，防止网络 stall 导致 run 永久卡住
 
   # Example: OpenAI model
   # - name: gpt-4

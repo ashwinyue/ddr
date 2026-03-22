@@ -436,7 +436,9 @@ class WeixinChannel(Channel):
             return None
         upload_param, file_key = result
 
-        ciphertext = _aes_ecb_encrypt(data, aes_key)
+        # 将 AES 加密 offload 到线程池，避免阻塞 asyncio 事件循环（大文件时尤为重要）
+        loop = asyncio.get_event_loop()
+        ciphertext = await loop.run_in_executor(None, _aes_ecb_encrypt, data, aes_key)
         cdn_upload_url = (
             f"{_CDN_BASE_URL}/upload"
             f"?encrypted_query_param={url_quote(upload_param)}"
@@ -633,7 +635,8 @@ class WeixinChannel(Channel):
                 consecutive_failures = 0
                 updates = result.get("msgs") or []
                 for update in updates:
-                    await self._handle_update(update)
+                    # create_task：不阻塞 poll loop，每条消息独立处理
+                    asyncio.create_task(self._handle_update(update))
 
             except asyncio.CancelledError:
                 break
@@ -705,16 +708,20 @@ class WeixinChannel(Channel):
                     logger.warning("[WeChat] failed to parse aes_key: %s", e)
 
             if key_bytes and len(key_bytes) == 16:
-                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                def _sync_aes_decrypt(raw: bytes, key: bytes) -> bytes:
+                    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                    cipher = Cipher(algorithms.AES(key), modes.ECB())
+                    decryptor = cipher.decryptor()
+                    result = decryptor.update(raw) + decryptor.finalize()
+                    if result:
+                        padding_len = result[-1]
+                        if 1 <= padding_len <= 16 and len(result) >= padding_len:
+                            result = result[:-padding_len]
+                    return result
 
-                cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
-                decryptor = cipher.decryptor()
-                decrypted = decryptor.update(data) + decryptor.finalize()
-                # Remove PKCS7 padding
-                if decrypted:
-                    padding_len = decrypted[-1]
-                    if 1 <= padding_len <= 16 and len(decrypted) >= padding_len:
-                        decrypted = decrypted[:-padding_len]
+                # Offload AES 解密到线程池，避免阻塞事件循环
+                loop = asyncio.get_event_loop()
+                decrypted = await loop.run_in_executor(None, _sync_aes_decrypt, data, key_bytes)
                 return decrypted
             else:
                 logger.warning("[WeChat] no valid AES key found, returning raw CDN data")
@@ -787,41 +794,26 @@ class WeixinChannel(Channel):
 
             msg_type = InboundMessageType.COMMAND if (text and text.startswith("/")) else InboundMessageType.CHAT
 
-            # Save image and inject path into text if available
+            # 图片通过 metadata["pending_images"] 传给 manager 统一处理
+            # manager._handle_pending_images 会在 thread 建立后将图片保存到正确目录
+            # 这样新用户的首条图片也不会丢失（无需提前知道 thread_id）
+            pending_images = []
             if image_data and image_filename:
-                try:
-                    from app.channels.store import ChannelStore
-                    from deerflow.config.paths import get_paths
-
-                    store = ChannelStore()
-                    thread_id = store.get_thread_id("weixin", from_user_id, topic_id=from_user_id)
-
-                    if thread_id:
-                        paths = get_paths()
-                        uploads_dir = paths.sandbox_uploads_dir(thread_id)
-                        uploads_dir.mkdir(parents=True, exist_ok=True)
-
-                        # Save image file
-                        image_path = uploads_dir / image_filename
-                        image_path.write_bytes(image_data)
-                        logger.info("[WeChat] saved image to %s (%d bytes)", image_path, len(image_data))
-
-                        # Inject image path into text
-                        virtual_path = f"/mnt/user-data/uploads/{image_filename}"
-                        if text:
-                            text = f"{text}\n\n[图片: {virtual_path}]"
-                        else:
-                            text = f"[图片: {virtual_path}]"
-                except Exception:
-                    logger.exception("[WeChat] failed to save image")
+                virtual_path = f"/mnt/user-data/uploads/{image_filename}"
+                pending_images.append({"filename": image_filename, "data": image_data})
+                if text:
+                    text = f"{text}\n\n[图片: {virtual_path}]"
+                else:
+                    text = f"[图片: {virtual_path}]"
+                logger.info("[WeChat] queued image for manager: %s (%d bytes)", image_filename, len(image_data))
 
             inbound = self._make_inbound(
                 chat_id=from_user_id,
                 user_id=from_user_id,
-                text=text or "",  # Ensure text is not None
+                text=text or "",
                 msg_type=msg_type,
                 thread_ts=context_token,
-                metadata={"context_token": context_token},
+                metadata={"context_token": context_token, "pending_images": pending_images},
             )
             # Each user gets a persistent DeerFlow thread
             inbound.topic_id = from_user_id
