@@ -36,7 +36,7 @@ export function Hero({ className }: { className?: string }) {
         flickerChance={0.25}
       />
       <div className="container-md relative z-10 mx-auto flex h-screen flex-col items-center justify-center">
-        <h1 className="flex items-center gap-2 text-4xl font-bold md:text-6xl">
+        <h1 className="flex flex-wrap items-center justify-center gap-2 text-4xl font-bold md:text-6xl">
           <WordRotate
             words={[
               "Deep Research",
@@ -57,16 +57,18 @@ export function Hero({ className }: { className?: string }) {
           <div>with DeerFlow</div>
         </h1>
         <p
-          className="mt-8 scale-105 text-center text-2xl text-shadow-sm"
+          className="mt-8 scale-105 px-4 text-center text-lg text-shadow-sm md:text-2xl"
           style={{ color: "rgb(184,184,192)" }}
         >
-          An open-source SuperAgent harness that researches, codes, and creates.
-          With
-          <br />
-          the help of sandboxes, memories, tools, skills and subagents, it
-          handles
-          <br />
-          different levels of tasks that could take minutes to hours.
+          An open-source SuperAgent harness that researches, codes, and creates.{" "}
+          <span className="hidden md:inline">
+            With the help of sandboxes, memories, tools, skills and subagents,
+            it handles different levels of tasks that could take minutes to
+            hours.
+          </span>
+          <span className="md:hidden">
+            Powered by sandboxes, memories, tools, skills and subagents.
+          </span>
         </p>
         <Link href="/workspace">
           <Button className="size-lg mt-8 scale-108" size="lg">

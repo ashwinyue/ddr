@@ -1,7 +1,7 @@
 import "@/styles/globals.css";
 import "katex/dist/katex.min.css";
 
-import { type Metadata } from "next";
+import { type Metadata, type Viewport } from "next";
 import { Geist } from "next/font/google";
 
 import { ThemeProvider } from "@/components/theme-provider";
@@ -11,6 +11,12 @@ import { detectLocaleServer } from "@/core/i18n/server";
 export const metadata: Metadata = {
   title: "DeerFlow",
   description: "A LangChain-based framework for building super agents.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
 };
 
 const geist = Geist({
