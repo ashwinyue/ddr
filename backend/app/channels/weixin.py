@@ -115,6 +115,9 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r"^[-*_]{3,}$", "", text, flags=re.MULTILINE)
     # Collapse excess blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
+    # Strip internal system/middleware notices injected by LoopDetectionMiddleware
+    # or other middlewares (lines starting with [NOTICE], [LOOP DETECTED], [FORCED STOP]).
+    text = re.sub(r"^\[(NOTICE|LOOP DETECTED|FORCED STOP)\][^\n]*\n?", "", text, flags=re.MULTILINE)
     return text.strip()
 
 

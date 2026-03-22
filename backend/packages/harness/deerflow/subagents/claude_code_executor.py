@@ -154,16 +154,30 @@ class ClaudeCodeExecutor:
     # Internal
     # ------------------------------------------------------------------
 
+    # All tools that Claude Code can call — pre-authorized to avoid interactive
+    # permission prompts without needing --dangerously-skip-permissions (which
+    # is blocked when running as root).
+    _ALL_ALLOWED_TOOLS = (
+        "Bash,Read,Write,Edit,MultiEdit,Glob,Grep,LS,"
+        "NotebookRead,NotebookEdit,TodoRead,TodoWrite,Task,WebFetch,WebSearch"
+    )
+
     def _build_args(self) -> list[str]:
         args = [
             "claude",
             "--output-format", "stream-json",
             "--verbose",
             "--input-format", "stream-json",
-            "--permission-prompt-tool", "stdio",
         ]
-        if self.permission_mode and self.permission_mode != "default":
-            args += ["--permission-mode", self.permission_mode]
+        if self.permission_mode == "bypassPermissions":
+            # bypassPermissions = --dangerously-skip-permissions, blocked on root.
+            # Use --allowedTools to pre-authorize all tools instead.
+            args += ["--allowedTools", self._ALL_ALLOWED_TOOLS]
+        elif self.permission_mode and self.permission_mode != "default":
+            args += ["--permission-mode", self.permission_mode,
+                     "--allowedTools", self._ALL_ALLOWED_TOOLS]
+        else:
+            args += ["--permission-prompt-tool", "stdio"]
         return args
 
     def _run(self, task: str, result: SubagentResult, on_event: EventCallback | None) -> None:

@@ -65,8 +65,13 @@ def _extract_response_text(result: dict | list) -> str:
 
         msg_type = msg.get("type")
 
-        # Stop at the last human message — anything before it is a previous turn
+        # Stop at the last human message — anything before it is a previous turn.
+        # Skip middleware-injected HumanMessages (loop detection notices) so
+        # we can still extract AI text from before the injection.
         if msg_type == "human":
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.startswith("[NOTICE]"):
+                continue
             break
 
         # Check for tool messages from ask_clarification (interrupt case)
@@ -632,6 +637,12 @@ class ChannelManager:
                     snapshot_text = _extract_response_text(data)
                     if snapshot_text:
                         latest_text = snapshot_text
+                elif event == "error":
+                    # LangGraph emits an error event (not an exception) for
+                    # GraphRecursionError and other agent-side failures.
+                    error_detail = str(data) if data else "unknown"
+                    stream_error = RuntimeError(f"Agent stream error: {error_detail}")
+                    logger.error("[Manager] stream error event: thread_id=%s, detail=%s", thread_id, error_detail)
 
                 if not latest_text or latest_text == last_published_text:
                     continue
@@ -666,9 +677,13 @@ class ChannelManager:
                 if attachments:
                     response_text = _format_artifact_text([attachment.virtual_path for attachment in attachments])
                 elif stream_error:
-                    response_text = "An error occurred while processing your request. Please try again."
+                    error_str = str(stream_error)
+                    if "recursion" in error_str.lower():
+                        response_text = "抱歉，任务步骤过多超出限制，请换一种更简单的方式描述您的需求。"
+                    else:
+                        response_text = "处理请求时出现错误，请重试。"
                 else:
-                    response_text = latest_text or "(No response from agent)"
+                    response_text = latest_text or "抱歉，未能获取回复，请重试。"
 
             logger.info(
                 "[Manager] streaming response completed: thread_id=%s, response_len=%d, artifacts=%d, error=%s",
