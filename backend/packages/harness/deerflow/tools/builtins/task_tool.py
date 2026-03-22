@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from dataclasses import replace
-from typing import Annotated, Literal
+from typing import Annotated
 
 from langchain.tools import InjectedToolCallId, ToolRuntime, tool
 from langgraph.config import get_stream_writer
@@ -13,7 +13,9 @@ from langgraph.typing import ContextT
 from deerflow.agents.lead_agent.prompt import get_skills_prompt_section
 from deerflow.agents.thread_state import ThreadState
 from deerflow.subagents import SubagentExecutor, get_subagent_config
+from deerflow.subagents.builtins.claude_code_agent import CLAUDE_CODE_DEFAULT_WORK_DIR
 from deerflow.subagents.executor import SubagentStatus, cleanup_background_task, get_background_task_result
+from deerflow.subagents.registry import get_subagent_names
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,7 @@ def task_tool(
     runtime: ToolRuntime[ContextT, ThreadState],
     description: str,
     prompt: str,
-    subagent_type: Literal["general-purpose", "bash", "claude-code"],
+    subagent_type: str,
     tool_call_id: Annotated[str, InjectedToolCallId],
     max_turns: int | None = None,
 ) -> str:
@@ -37,7 +39,7 @@ def task_tool(
     - Handle complex multi-step tasks autonomously
     - Execute commands or operations in isolated contexts
 
-    Available subagent types:
+    Built-in subagent types:
     - **general-purpose**: A capable agent for complex, multi-step tasks that require
       both exploration and action. Use when the task requires complex reasoning,
       multiple dependent steps, or would benefit from isolated context.
@@ -47,6 +49,9 @@ def task_tool(
       Use when writing new code, implementing features, modifying source files,
       debugging, refactoring, or any task where the primary deliverable is working
       code in the filesystem. Requires the `claude` CLI to be installed.
+
+    Additional dynamically-registered subagent types are also available. Use
+    the create_subagent tool to register new ones at runtime.
 
     When to use this tool:
     - Complex tasks requiring multiple steps or tools
@@ -64,10 +69,11 @@ def task_tool(
         subagent_type: The type of subagent to use. ALWAYS PROVIDE THIS PARAMETER THIRD.
         max_turns: Optional maximum number of agent turns. Defaults to subagent's configured max.
     """
-    # Get subagent configuration
+    # Get subagent configuration (built-in or dynamic)
     config = get_subagent_config(subagent_type)
     if config is None:
-        return f"Error: Unknown subagent type '{subagent_type}'. Available: general-purpose, bash, claude-code"
+        available = ", ".join(get_subagent_names())
+        return f"Error: Unknown subagent type '{subagent_type}'. Available: {available}"
 
     # Build config overrides
     overrides: dict = {}
@@ -106,22 +112,27 @@ def task_tool(
         # Read verbose flag: channel-level setting (via configurable) takes priority over config.yaml
         configurable = runtime.config.get("configurable", {}) if runtime else {}
         verbose_override = configurable.get("claude_code_verbose")
+        # SECURITY: work_dir defaults to "/" for full filesystem access in trusted
+        # single-user environments. See CLAUDE_CODE_DEFAULT_WORK_DIR docs for details.
         return _run_claude_code(
             prompt=prompt,
             description=description,
             config=config,
             task_id=tool_call_id,
             trace_id=trace_id,
-            work_dir="/",
+            work_dir=CLAUDE_CODE_DEFAULT_WORK_DIR,
             verbose_override=verbose_override,
         )
 
-    # Get available tools (excluding task tool to prevent nesting)
+    # Get available tools. By default subagents cannot use task tool (prevent nesting).
+    # Dynamic subagents created with allow_nested_tasks=True are the exception.
     # Lazy import to avoid circular dependency
     from deerflow.tools import get_available_tools
 
-    # Subagents should not have subagent tools enabled (prevent recursive nesting)
-    tools = get_available_tools(model_name=parent_model, subagent_enabled=False)
+    nested_tasks_allowed = getattr(config, "allow_nested_tasks", False)
+    tools = get_available_tools(model_name=parent_model, subagent_enabled=nested_tasks_allowed)
+    if nested_tasks_allowed:
+        logger.debug("[trace=%s] Subagent '%s' has allow_nested_tasks=True; task tool included", trace_id, subagent_type)
 
     # Create executor
     executor = SubagentExecutor(

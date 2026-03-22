@@ -16,6 +16,9 @@ class SubagentConfig:
         model: Model to use - 'inherit' uses parent's model.
         max_turns: Maximum number of agent turns before stopping.
         timeout_seconds: Maximum execution time in seconds (default: 900 = 15 minutes).
+        allow_nested_tasks: If True, this subagent may itself use the task tool to spawn
+                            further subagents (one level of nesting). Defaults to False
+                            to prevent unbounded recursion.
     """
 
     name: str
@@ -26,3 +29,4 @@ class SubagentConfig:
     model: str = "inherit"
     max_turns: int = 50
     timeout_seconds: int = 900
+    allow_nested_tasks: bool = False  # If True, this subagent may spawn further subagents via task tool

@@ -1,6 +1,21 @@
 """Claude Code CLI subagent configuration."""
 
+import os
+
 from deerflow.subagents.config import SubagentConfig
+
+# Claude Code 子代理的默认工作目录
+# 
+# SECURITY NOTE: "/" is an INTENTIONAL design choice for trusted single-user environments
+# where the user owns the entire system. This allows Claude Code to access and modify
+# code anywhere on the filesystem, essential for cross-project refactoring and 
+# system-wide operations.
+#
+# For multi-tenant or untrusted environments:
+# - Set CLAUDE_CODE_WORK_DIR to a restricted path (e.g., "/home/user/projects")
+# - Or use AioSandbox with Docker-based isolation instead of LocalSandbox
+# See: https://docs.deerflow.dev/security/deployment-modes
+CLAUDE_CODE_DEFAULT_WORK_DIR = os.environ.get("CLAUDE_CODE_WORK_DIR", "/")
 
 CLAUDE_CODE_AGENT_CONFIG = SubagentConfig(
     name="claude-code",
