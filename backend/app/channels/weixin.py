@@ -486,9 +486,12 @@ class WeixinChannel(Channel):
                             {
                                 "type": _IMAGE_TYPE,
                                 "image_item": {
+                                    # aeskey (hex) at top level — WeChat client's preferred field
+                                    "aeskey": aes_key.hex(),
                                     "media": {
                                         "encrypt_query_param": download_param,
-                                        "aes_key": base64.b64encode(aes_key).decode(),
+                                        # base64(hex_string) mirrors what WeChat server sends us
+                                        "aes_key": base64.b64encode(aes_key.hex().encode()).decode(),
                                         "encrypt_type": 1,
                                     },
                                     "mid_size": cipher_size,
