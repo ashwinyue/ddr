@@ -1,6 +1,6 @@
 # DeerFlow - Unified Development Environment
 
-.PHONY: help config config-upgrade check install setup-feishu dev dev-daemon start stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
+.PHONY: help config config-upgrade check install setup-feishu setup-weixin dev dev-daemon start stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
 
 PYTHON ?= python
 
@@ -9,6 +9,7 @@ help:
 	@echo "  make config          - Generate local config files (aborts if config already exists)"
 	@echo "  make config-upgrade  - Merge new fields from config.example.yaml into config.yaml"
 	@echo "  make setup-feishu    - Interactive QR code setup for Feishu bot credentials"
+	@echo "  make setup-weixin    - Interactive QR code setup for WeChat bot credentials"
 	@echo "  make check           - Check if all required tools are installed"
 	@echo "  make install         - Install all dependencies (frontend + backend)"
 	@echo "  make setup-sandbox   - Pre-pull sandbox container image (recommended)"
@@ -38,6 +39,9 @@ config-upgrade:
 
 setup-feishu:
 	@./scripts/setup-feishu.sh $(FEISHU_FLAGS)
+
+setup-weixin:
+	@./scripts/setup-weixin.sh
 
 # Check required tools
 check:

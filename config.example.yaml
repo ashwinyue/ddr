@@ -460,6 +460,12 @@ checkpointer:
 #     app_id: $FEISHU_APP_ID
 #     app_secret: $FEISHU_APP_SECRET
 #
+#   weixin:
+#     enabled: false
+#     bot_token: $WEIXIN_BOT_TOKEN   # from: make setup-weixin
+#     bot_id: $WEIXIN_BOT_ID
+#     base_url: $WEIXIN_BASE_URL     # default: https://ilinkai.weixin.qq.com
+#
 #   slack:
 #     enabled: false
 #     bot_token: $SLACK_BOT_TOKEN     # xoxb-...

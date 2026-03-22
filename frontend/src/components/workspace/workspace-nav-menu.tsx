@@ -5,6 +5,7 @@ import {
   ChevronsUpDown,
   GlobeIcon,
   InfoIcon,
+  LogOutIcon,
   MailIcon,
   Settings2Icon,
   SettingsIcon,
@@ -145,6 +146,16 @@ export function WorkspaceNavMenu() {
                 >
                   <InfoIcon />
                   {t.workspace.about}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={async () => {
+                    await fetch("/api/logout", { method: "POST" });
+                    window.location.href = "/login";
+                  }}
+                >
+                  <LogOutIcon />
+                  退出登录
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

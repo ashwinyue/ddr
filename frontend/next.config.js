@@ -7,6 +7,7 @@ import "./src/env.js";
 /** @type {import("next").NextConfig} */
 const config = {
   devIndicators: false,
+  allowedDevOrigins: ["43.156.118.105"],
 };
 
 export default config;
