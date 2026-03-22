@@ -230,14 +230,21 @@ def _format_artifact_text(artifacts: list[str]) -> str:
 
 
 _OUTPUTS_VIRTUAL_PREFIX = "/mnt/user-data/outputs/"
+_WORKSPACE_VIRTUAL_PREFIX = "/mnt/user-data/workspace/"
+
+# Paths allowed to be sent as attachments via IM channels.
+# uploads/ is intentionally excluded to prevent user-uploaded files from
+# being forwarded without explicit intent (e.g. sensitive documents).
+_ALLOWED_VIRTUAL_PREFIXES = (_OUTPUTS_VIRTUAL_PREFIX, _WORKSPACE_VIRTUAL_PREFIX)
 
 
 def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedAttachment]:
     """Resolve virtual artifact paths to host filesystem paths with metadata.
 
-    Only paths under ``/mnt/user-data/outputs/`` are accepted; any other
-    virtual path is rejected with a warning to prevent exfiltrating uploads
-    or workspace files via IM channels.
+    Accepts paths under ``/mnt/user-data/outputs/`` (agent output files) and
+    ``/mnt/user-data/workspace/`` (agent-generated code / working files).
+    Paths under ``/mnt/user-data/uploads/`` are rejected to prevent forwarding
+    user-uploaded files via IM channels.
 
     Skips artifacts that cannot be resolved (missing files, invalid paths)
     and logs warnings for them.
@@ -247,19 +254,31 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
     attachments: list[ResolvedAttachment] = []
     paths = get_paths()
     outputs_dir = paths.sandbox_outputs_dir(thread_id).resolve()
+    workspace_dir = paths.sandbox_work_dir(thread_id).resolve()
+
     for virtual_path in artifacts:
-        # Security: only allow files from the agent outputs directory
-        if not virtual_path.startswith(_OUTPUTS_VIRTUAL_PREFIX):
-            logger.warning("[Manager] rejected non-outputs artifact path: %s", virtual_path)
+        # Security: only allow outputs/ and workspace/ — never uploads/
+        if not any(virtual_path.startswith(prefix) for prefix in _ALLOWED_VIRTUAL_PREFIXES):
+            logger.warning("[Manager] rejected artifact path (not in outputs/workspace): %s", virtual_path)
             continue
         try:
             actual = paths.resolve_virtual_path(thread_id, virtual_path)
-            # Verify the resolved path is actually under the outputs directory
-            # (guards against path-traversal even after prefix check)
+            resolved = actual.resolve()
+            # Path-traversal guard: must remain under its allowed root
+            in_outputs = False
+            in_workspace = False
             try:
-                actual.resolve().relative_to(outputs_dir)
+                resolved.relative_to(outputs_dir)
+                in_outputs = True
             except ValueError:
-                logger.warning("[Manager] artifact path escapes outputs dir: %s -> %s", virtual_path, actual)
+                pass
+            try:
+                resolved.relative_to(workspace_dir)
+                in_workspace = True
+            except ValueError:
+                pass
+            if not (in_outputs or in_workspace):
+                logger.warning("[Manager] artifact path escapes allowed dirs: %s -> %s", virtual_path, actual)
                 continue
             if not actual.is_file():
                 logger.warning("[Manager] artifact not found on disk: %s -> %s", virtual_path, actual)
@@ -452,6 +471,44 @@ class ChannelManager:
 
     # -- chat handling -----------------------------------------------------
 
+    async def _handle_pending_images(self, msg: InboundMessage, thread_id: str) -> None:
+        """Save pending images from IM channels to thread uploads directory.
+
+        Some IM channels (Feishu, WeChat) send images that need to be downloaded
+        and saved before the agent can view them. This method handles such images
+        stored in message metadata.
+        """
+        pending_images = msg.metadata.get("pending_images", [])
+        if not pending_images:
+            return
+
+        from deerflow.config.paths import get_paths
+
+        paths = get_paths()
+        uploads_dir = paths.sandbox_uploads_dir(thread_id)
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_count = 0
+        for img in pending_images:
+            filename = img.get("filename")
+            data = img.get("data")
+            if filename and data:
+                try:
+                    image_path = uploads_dir / filename
+                    # data might be base64 encoded or bytes
+                    if isinstance(data, str):
+                        import base64
+                        data = base64.b64decode(data)
+                    image_path.write_bytes(data)
+                    saved_count += 1
+                    logger.info("[Manager] saved pending image to %s (%d bytes)", image_path, len(data))
+                except Exception as exc:
+                    logger.warning("[Manager] failed to save pending image %s: %s", filename, exc)
+
+        # Clear pending images after processing
+        msg.metadata["pending_images"] = []
+        logger.info("[Manager] processed %d/%d pending images for thread %s", saved_count, len(pending_images), thread_id)
+
     async def _create_thread(self, client, msg: InboundMessage) -> str:
         """Create a new thread on the LangGraph Server and store the mapping."""
         thread = await client.threads.create()
@@ -479,6 +536,9 @@ class ChannelManager:
         # No existing thread found — create a new one
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
+
+        # Handle pending images from IM channels (e.g., Feishu/WeChat images)
+        await self._handle_pending_images(msg, thread_id)
 
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
         if msg.channel_name == "feishu":

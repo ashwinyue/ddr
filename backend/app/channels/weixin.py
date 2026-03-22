@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import os
 import random
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote as url_quote
 
 import httpx
 
@@ -22,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 # ilink API constants
 _ILINK_DEFAULT_BASE = "https://ilinkai.weixin.qq.com"
+_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+
+# CDN media type constants (used by getuploadurl API)
+_UPLOAD_MEDIA_IMAGE = 1
+_UPLOAD_MEDIA_VIDEO = 2
+_UPLOAD_MEDIA_FILE = 3
 _POLL_TIMEOUT = 38        # seconds — server holds up to 35s, 3s client margin
 _RECONNECT_DELAY = 2      # seconds between retry attempts
 _BACKOFF_DELAY = 30       # seconds after MAX_CONSECUTIVE_FAILURES
@@ -50,6 +59,23 @@ def _random_uin() -> str:
     """Generate X-WECHAT-UIN header: base64(str(random_uint32))."""
     val = random.randint(0, 2**32 - 1)
     return base64.b64encode(str(val).encode()).decode()
+
+
+def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB encrypt with PKCS7 padding (mirrors cc-connect encryptAESECB)."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    block_size = 16
+    n = block_size - (len(data) % block_size)
+    padded = data + bytes([n] * n)
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    enc = cipher.encryptor()
+    return enc.update(padded) + enc.finalize()
+
+
+def _aes_ecb_padded_size(plaintext_len: int) -> int:
+    """Return AES-128-ECB ciphertext length for given plaintext length."""
+    return ((plaintext_len + 16) // 16) * 16
 
 
 def _strip_markdown(text: str) -> str:
@@ -263,17 +289,25 @@ class WeixinChannel(Channel):
                 logger.error("[WeChat] send failed after %d attempts: %s", _max_retries, last_exc)
                 raise last_exc  # type: ignore[misc]
 
-            # Send image attachments if any
+            # Send attachments (images and files)
             for attachment in msg.attachments:
-                if attachment.is_image:
-                    try:
+                try:
+                    if attachment.is_image:
                         await self._send_image(
                             to_user_id=msg.chat_id,
                             image_path=attachment.actual_path,
                             context_token=context_token,
                         )
-                    except Exception as exc:
-                        logger.warning("[WeChat] failed to send image %s: %s", attachment.filename, exc)
+                    else:
+                        # Send as file attachment (PDF, ZIP, DOC, etc.)
+                        await self._send_file(
+                            to_user_id=msg.chat_id,
+                            file_path=attachment.actual_path,
+                            context_token=context_token,
+                            filename=attachment.filename,
+                        )
+                except Exception as exc:
+                    logger.warning("[WeChat] failed to send attachment %s: %s", attachment.filename, exc)
         finally:
             # Always cancel typing indicator — mirrors SDK's processOneMessage finally block
             if typing_ticket:
@@ -353,35 +387,172 @@ class WeixinChannel(Channel):
             logger.debug("[WeChat] getConfig failed for %s: %s", user_id, exc)
             return {}
 
-    async def _send_image(self, to_user_id: str, image_path: Path, context_token: str) -> None:
-        """Send an image message to a WeChat user.
+    async def _get_upload_url(self, to_user_id: str, raw_data: bytes, aes_key_hex: str, media_type: int = _UPLOAD_MEDIA_IMAGE) -> tuple[str, str] | None:
+        """Call /ilink/bot/getuploadurl to get CDN upload parameters.
 
-        Note: WeChat requires images to be uploaded to their CDN first before sending.
-        This is a simplified implementation that logs the attempt. Full implementation
-        would require:
-        1. Upload image to WeChat CDN
-        2. Get filekey and aeskey
-        3. Send image message with CDN reference
+        Returns (upload_param, filekey) or None on failure.
+        Mirrors cc-connect getUploadURL in client.go.
         """
-        logger.info("[WeChat] sending image: to=%s, path=%s", to_user_id, image_path)
+        raw_size = len(raw_data)
+        padded_size = _aes_ecb_padded_size(raw_size)
+        file_key = os.urandom(16).hex()
+        raw_md5 = hashlib.md5(raw_data).hexdigest()
 
         try:
-            # Read image file
-            image_bytes = image_path.read_bytes()
-            if len(image_bytes) > 10 * 1024 * 1024:  # 10MB limit
-                logger.warning("[WeChat] image too large (%d bytes), skipping: %s", len(image_bytes), image_path)
-                return
-
-            # TODO: Implement CDN upload for WeChat
-            # For now, send a text message indicating an image was generated
-            await self._send_text(
-                to_user_id=to_user_id,
-                text=f"[图片: {image_path.name}]",
-                context_token=context_token,
+            resp = await self._api_post(
+                "/ilink/bot/getuploadurl",
+                {
+                    "filekey": file_key,
+                    "media_type": media_type,
+                    "to_user_id": to_user_id,
+                    "rawsize": raw_size,
+                    "rawfilemd5": raw_md5,
+                    "filesize": padded_size,
+                    "no_need_thumb": True,
+                    "aeskey": aes_key_hex,
+                    "base_info": _BASE_INFO,
+                },
             )
-            logger.info("[WeChat] image placeholder sent for %s", image_path.name)
+            upload_param = resp.get("upload_param", "")
+            if not upload_param:
+                logger.warning("[WeChat] getuploadurl returned empty upload_param: %s", resp)
+                return None
+            return upload_param, file_key
+        except Exception as exc:
+            logger.warning("[WeChat] getuploadurl failed: %s", exc)
+            return None
+
+    async def _upload_to_cdn(self, to_user_id: str, data: bytes, media_type: int) -> tuple[str, bytes, int, int] | None:
+        """Upload data to WeChat CDN with AES-128-ECB encryption.
+
+        Shared by _send_image(), _send_file().
+        Mirrors cc-connect uploadToWeixinCDN.
+
+        Returns (download_param, aes_key, cipher_size, raw_size) or None on failure.
+        """
+        aes_key = os.urandom(16)
+        result = await self._get_upload_url(to_user_id, data, aes_key.hex(), media_type)
+        if result is None:
+            return None
+        upload_param, file_key = result
+
+        ciphertext = _aes_ecb_encrypt(data, aes_key)
+        cdn_upload_url = (
+            f"{_CDN_BASE_URL}/upload"
+            f"?encrypted_query_param={url_quote(upload_param)}"
+            f"&filekey={url_quote(file_key)}"
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            upload_resp = await client.post(
+                cdn_upload_url,
+                content=ciphertext,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            upload_resp.raise_for_status()
+
+        download_param = upload_resp.headers.get("x-encrypted-param", "")
+        if not download_param:
+            logger.error("[WeChat] CDN upload response missing x-encrypted-param header")
+            return None
+        return download_param, aes_key, len(ciphertext), len(data)
+
+    async def _send_image(self, to_user_id: str, image_path: Path, context_token: str) -> None:
+        """Send an image to a WeChat user via CDN upload.
+
+        Mirrors cc-connect SendImage / weixin-agent-sdk sendImageMessageWeixin.
+        image_item.mid_size = ciphertext size (NOT raw size).
+        """
+        logger.info("[WeChat] sending image via CDN: to=%s, path=%s", to_user_id, image_path)
+        try:
+            data = image_path.read_bytes()
+            if len(data) > 10 * 1024 * 1024:
+                logger.warning("[WeChat] image too large (%d bytes), skipping: %s", len(data), image_path)
+                return
+            ref = await self._upload_to_cdn(to_user_id, data, _UPLOAD_MEDIA_IMAGE)
+            if ref is None:
+                logger.error("[WeChat] CDN upload failed for image %s", image_path.name)
+                return
+            download_param, aes_key, cipher_size, _ = ref
+            await self._api_post(
+                "/ilink/bot/sendmessage",
+                {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": to_user_id,
+                        "client_id": str(uuid.uuid4()),
+                        "message_type": _BOT_MESSAGE_TYPE,
+                        "message_state": _MSG_STATE_FINISH,
+                        "item_list": [
+                            {
+                                "type": _IMAGE_TYPE,
+                                "image_item": {
+                                    "media": {
+                                        "encrypt_query_param": download_param,
+                                        "aes_key": base64.b64encode(aes_key).decode(),
+                                        "encrypt_type": 1,
+                                    },
+                                    "mid_size": cipher_size,
+                                },
+                            }
+                        ],
+                        "context_token": context_token,
+                    },
+                    "base_info": _BASE_INFO,
+                },
+            )
+            logger.info("[WeChat] image sent: %s (%d bytes)", image_path.name, len(data))
         except Exception:
-            logger.exception("[WeChat] failed to send image")
+            logger.exception("[WeChat] failed to send image %s", image_path.name)
+
+    async def _send_file(self, to_user_id: str, file_path: Path, context_token: str, filename: str | None = None) -> None:
+        """Send a file attachment to a WeChat user via CDN upload.
+
+        Mirrors cc-connect SendFile / weixin-agent-sdk sendFileMessageWeixin.
+        file_item.len = raw (plaintext) size as string (NOT cipher size).
+        """
+        file_name = filename or file_path.name
+        logger.info("[WeChat] sending file via CDN: to=%s, path=%s, name=%s", to_user_id, file_path, file_name)
+        try:
+            data = file_path.read_bytes()
+            if len(data) > 100 * 1024 * 1024:
+                logger.warning("[WeChat] file too large (%d bytes), skipping: %s", len(data), file_path)
+                return
+            ref = await self._upload_to_cdn(to_user_id, data, _UPLOAD_MEDIA_FILE)
+            if ref is None:
+                logger.error("[WeChat] CDN upload failed for file %s", file_name)
+                return
+            download_param, aes_key, _, raw_size = ref
+            await self._api_post(
+                "/ilink/bot/sendmessage",
+                {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": to_user_id,
+                        "client_id": str(uuid.uuid4()),
+                        "message_type": _BOT_MESSAGE_TYPE,
+                        "message_state": _MSG_STATE_FINISH,
+                        "item_list": [
+                            {
+                                "type": _FILE_TYPE,
+                                "file_item": {
+                                    "media": {
+                                        "encrypt_query_param": download_param,
+                                        "aes_key": base64.b64encode(aes_key).decode(),
+                                        "encrypt_type": 1,
+                                    },
+                                    "file_name": file_name,
+                                    "len": str(raw_size),  # raw plaintext size, not cipher
+                                },
+                            }
+                        ],
+                        "context_token": context_token,
+                    },
+                    "base_info": _BASE_INFO,
+                },
+            )
+            logger.info("[WeChat] file sent: %s (%d bytes)", file_name, raw_size)
+        except Exception:
+            logger.exception("[WeChat] failed to send file %s", file_name)
 
     async def _send_typing(self, user_id: str, typing_ticket: str, status: int) -> None:
         """Send typing indicator to a user (fire-and-forget).
@@ -501,8 +672,10 @@ class WeixinChannel(Channel):
             return None
 
         try:
-            # Build CDN download URL
-            cdn_url = f"https://cdn.weixin.qq.com/download?encrypted_query_param={encrypt_query_param}"
+            # Build CDN download URL — mirrors cc-connect buildCdnDownloadURL
+            # CDN base: https://novac2c.cdn.weixin.qq.com/c2c (NOT cdn.weixin.qq.com)
+            # Parameters must be URL-encoded (may contain '+', '/', '=' etc.)
+            cdn_url = f"{_CDN_BASE_URL}/download?encrypted_query_param={url_quote(encrypt_query_param)}"
 
             # Download from CDN
             async with httpx.AsyncClient(timeout=30) as client:
@@ -510,43 +683,40 @@ class WeixinChannel(Channel):
                 resp.raise_for_status()
                 data = resp.content
 
-            # Decrypt if AES key is available
+            # Resolve AES key: prefer aeskey (hex) from image_item, fallback to media.aes_key (base64)
+            # Mirrors cc-connect parseAesKey logic
+            key_bytes: bytes | None = None
             if aeskey_hex and len(aeskey_hex) == 32:
-                # Convert hex aeskey to bytes for AES-128-ECB decryption
-                import hashlib
+                # image_item.aeskey — raw hex string representing 16 bytes
+                key_bytes = bytes.fromhex(aeskey_hex)
+            elif aes_key:
+                # image_item.media.aes_key — base64(raw 16 bytes) OR base64(32-char hex ASCII)
+                try:
+                    decoded = base64.b64decode(aes_key)
+                    if len(decoded) == 16:
+                        key_bytes = decoded
+                    elif len(decoded) == 32:
+                        # base64 wraps a 32-char hex string
+                        key_bytes = bytes.fromhex(decoded.decode("ascii"))
+                except Exception as e:
+                    logger.warning("[WeChat] failed to parse aes_key: %s", e)
+
+            if key_bytes and len(key_bytes) == 16:
                 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-                # aeskey is hex string, need to convert to bytes
-                key_bytes = bytes.fromhex(aeskey_hex)
-                if len(key_bytes) == 16:
-                    cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
-                    decryptor = cipher.decryptor()
-                    decrypted = decryptor.update(data) + decryptor.finalize()
-                    # Remove PKCS7 padding
+                cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
+                decryptor = cipher.decryptor()
+                decrypted = decryptor.update(data) + decryptor.finalize()
+                # Remove PKCS7 padding
+                if decrypted:
                     padding_len = decrypted[-1]
-                    if padding_len <= 16:
+                    if 1 <= padding_len <= 16 and len(decrypted) >= padding_len:
                         decrypted = decrypted[:-padding_len]
-                    return decrypted
-                else:
-                    logger.warning("[WeChat] aeskey length is not 16 bytes: %d", len(key_bytes))
-            elif aes_key:
-                # Try base64 decoded aes_key
-                try:
-                    key_bytes = base64.b64decode(aes_key)
-                    if len(key_bytes) == 16:
-                        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-                        cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
-                        decryptor = cipher.decryptor()
-                        decrypted = decryptor.update(data) + decryptor.finalize()
-                        # Remove PKCS7 padding
-                        padding_len = decrypted[-1]
-                        if padding_len <= 16:
-                            decrypted = decrypted[:-padding_len]
-                        return decrypted
-                except Exception as e:
-                    logger.warning("[WeChat] failed to decrypt with aes_key: %s", e)
+                return decrypted
+            else:
+                logger.warning("[WeChat] no valid AES key found, returning raw CDN data")
 
-            # Return as-is if no decryption needed or failed
+            # Return as-is if no decryption key available
             return data
         except Exception:
             logger.exception("[WeChat] error downloading/decrypting image")
@@ -570,12 +740,16 @@ class WeixinChannel(Channel):
 
             for item in item_list:
                 item_type = item.get("type")
+                logger.info("[WeChat] item type: %s (expected image=%s)", item_type, _IMAGE_TYPE)
                 if item_type == _IMAGE_TYPE:
                     # Image message - download and process
-                    logger.info("[WeChat] received image from user_id=%s", from_user_id)
+                    logger.info("[WeChat] received image from user_id=%s, item=%s", from_user_id, item)
                     image_data = await self._download_weixin_image(item)
                     if image_data:
                         image_filename = f"weixin_{from_user_id}_{int(time.time())}.jpg"
+                        logger.info("[WeChat] image downloaded: %s (%d bytes)", image_filename, len(image_data))
+                    else:
+                        logger.warning("[WeChat] image download failed for user_id=%s", from_user_id)
                     # Continue to check for text in same message
                 elif item_type == _TEXT_TYPE:
                     # Extract text

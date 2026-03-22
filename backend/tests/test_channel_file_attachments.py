@@ -185,17 +185,41 @@ class TestResolveAttachments:
         assert result == []
         mock_paths.resolve_virtual_path.assert_not_called()
 
-    def test_rejects_workspace_path(self):
-        """Paths under /mnt/user-data/workspace/ are rejected (security)."""
+    def test_rejects_uploads_path_not_workspace(self):
+        """Paths under /mnt/user-data/uploads/ are rejected (security).
+        workspace/ paths ARE allowed (agent-generated code files).
+        """
         from app.channels.manager import _resolve_attachments
 
         mock_paths = MagicMock()
 
         with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
-            result = _resolve_attachments("t1", ["/mnt/user-data/workspace/config.py"])
+            result = _resolve_attachments("t1", ["/mnt/user-data/uploads/secret.pdf"])
 
         assert result == []
         mock_paths.resolve_virtual_path.assert_not_called()
+
+    def test_allows_workspace_path(self, tmp_path):
+        """Paths under /mnt/user-data/workspace/ are allowed (agent-generated code)."""
+        from app.channels.manager import _resolve_attachments
+
+        thread_id = "t1"
+        workspace_dir = tmp_path / "threads" / thread_id / "user-data" / "workspace"
+        workspace_dir.mkdir(parents=True)
+        go_file = workspace_dir / "main.go"
+        go_file.write_text("package main\n")
+
+        mock_paths = MagicMock()
+        mock_paths.sandbox_outputs_dir.return_value = tmp_path / "threads" / thread_id / "user-data" / "outputs"
+        mock_paths.sandbox_work_dir.return_value = workspace_dir
+        mock_paths.resolve_virtual_path.return_value = go_file
+
+        with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
+            result = _resolve_attachments(thread_id, ["/mnt/user-data/workspace/main.go"])
+
+        assert len(result) == 1
+        assert result[0].filename == "main.go"
+        assert result[0].is_image is False
 
     def test_rejects_path_traversal_escape(self, tmp_path):
         """Paths that escape the outputs directory after resolution are rejected."""

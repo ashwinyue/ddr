@@ -1,6 +1,6 @@
 # DeerFlow - Unified Development Environment
 
-.PHONY: help config config-upgrade check install setup-feishu setup-weixin dev dev-daemon start stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
+.PHONY: help config config-upgrade check install setup-feishu setup-weixin dev dev-daemon dd start stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
 
 PYTHON ?= python
 
@@ -107,6 +107,8 @@ start:
 # Start all services in daemon mode (background)
 dev-daemon:
 	@./scripts/start-daemon.sh
+
+dd: dev-daemon
 
 # Stop all services
 stop:
