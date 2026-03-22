@@ -444,11 +444,75 @@ class FeishuChannel(Channel):
         except Exception:
             pass
 
-    async def _prepare_inbound(self, msg_id: str, inbound) -> None:
-        """Kick off Feishu side effects without delaying inbound dispatch."""
+    async def _download_image(self, message_id: str, image_key: str) -> bytes | None:
+        """Download image from Feishu by image_key.
+
+        Args:
+            message_id: The message ID containing the image.
+            image_key: The image key from the message content.
+
+        Returns:
+            Image bytes or None if download fails.
+        """
+        if not self._api_client:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+            request = GetMessageResourceRequest.builder().message_id(message_id).file_key(image_key).type("image").build()
+            response = await asyncio.to_thread(self._api_client.im.v1.message_resource.get, request)
+            if response.success() and response.file:
+                return response.file.read()
+            logger.warning("[Feishu] failed to download image: code=%s, msg=%s", response.code, response.msg)
+        except Exception:
+            logger.exception("[Feishu] error downloading image")
+        return None
+
+    async def _prepare_inbound(self, msg_id: str, inbound, image_data: bytes | None = None, image_filename: str | None = None) -> None:
+        """Kick off Feishu side effects without delaying inbound dispatch.
+
+        If image_data is provided, saves it to the thread's uploads directory
+        and injects the image path into the inbound message.
+        """
         reaction_task = asyncio.create_task(self._add_reaction(msg_id, "OK"))
         self._track_background_task(reaction_task, name="add_reaction", msg_id=msg_id)
         self._ensure_running_card_started(msg_id)
+
+        # Save image to thread uploads if provided
+        if image_data and image_filename:
+            try:
+                # Get or create thread_id for this chat
+                from app.channels.store import ChannelStore
+                from deerflow.config.paths import get_paths
+
+                store = ChannelStore()
+                thread_id = store.get_thread_id(inbound.channel_name, inbound.chat_id, topic_id=inbound.topic_id)
+
+                if thread_id:
+                    paths = get_paths()
+                    uploads_dir = paths.sandbox_uploads_dir(thread_id)
+                    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save image file
+                    image_path = uploads_dir / image_filename
+                    image_path.write_bytes(image_data)
+                    logger.info("[Feishu] saved image to %s (%d bytes)", image_path, len(image_data))
+
+                    # Inject image path into text
+                    virtual_path = f"/mnt/user-data/uploads/{image_filename}"
+                    if inbound.text:
+                        inbound.text = f"{inbound.text}\n\n[图片: {virtual_path}]"
+                    else:
+                        inbound.text = f"[图片: {virtual_path}]"
+
+                    # Add file info to metadata for view_image tool
+                    inbound.metadata = inbound.metadata or {}
+                    inbound.metadata["files"] = inbound.metadata.get("files", []) + [
+                        {"filename": image_filename, "path": virtual_path, "size": len(image_data)}
+                    ]
+            except Exception:
+                logger.exception("[Feishu] failed to save image")
+
         await self.bus.publish_inbound(inbound)
 
     def _on_message(self, event) -> None:
@@ -460,24 +524,45 @@ class FeishuChannel(Channel):
             msg_id = message.message_id
             sender_id = event.event.sender.sender_id.open_id
 
+            # Try both msg_type and message_type (飞书 SDK uses message_type)
+            msg_type_str = getattr(message, "msg_type", "") or getattr(message, "message_type", "") or ""
+
+            # Debug: log message type detection
+            logger.info("[Feishu] message type detection: msg_type=%s, message_type=%s, result=%s",
+                       getattr(message, "msg_type", "MISSING"),
+                       getattr(message, "message_type", "MISSING"),
+                       msg_type_str)
+
             # root_id is set when the message is a reply within a Feishu thread.
             # Use it as topic_id so all replies share the same DeerFlow thread.
             root_id = getattr(message, "root_id", None) or None
 
-            # Parse message content
+            # Parse message content based on message type
             content = json.loads(message.content)
-            text = content.get("text", "").strip()
+            text = ""
+            image_key = None
+
+            if msg_type_str == "image":
+                # Image message
+                image_key = content.get("image_key")
+                text = content.get("text", "").strip() or ""
+                logger.info("[Feishu] received image message: chat_id=%s, msg_id=%s, image_key=%s", chat_id, msg_id, image_key)
+            else:
+                # Text message (default)
+                text = content.get("text", "").strip()
+
             logger.info(
-                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, text=%r",
+                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, type=%s, text=%r",
                 chat_id,
                 msg_id,
                 root_id,
                 sender_id,
+                msg_type_str or "text",
                 text[:100] if text else "",
             )
 
-            if not text:
-                logger.info("[Feishu] empty text, ignoring message")
+            if not text and not image_key:
+                logger.info("[Feishu] empty text and no image, ignoring message")
                 return
 
             # Check if it's a command
@@ -489,10 +574,17 @@ class FeishuChannel(Channel):
             # topic_id: use root_id for replies (same topic), msg_id for new messages (new topic)
             topic_id = root_id or msg_id
 
+            # Prepare files list if there's an image
+            files = []
+            if image_key:
+                # Download image now (we're in a thread, but _download_image is async)
+                # For simplicity, we'll download in _handle_image_message and update inbound
+                pass
+
             inbound = self._make_inbound(
                 chat_id=chat_id,
                 user_id=sender_id,
-                text=text,
+                text=text or "",  # Will be updated with image path in _prepare_inbound
                 msg_type=msg_type,
                 thread_ts=msg_id,
                 metadata={"message_id": msg_id, "root_id": root_id},
@@ -502,9 +594,37 @@ class FeishuChannel(Channel):
             # Schedule on the async event loop
             if self._main_loop and self._main_loop.is_running():
                 logger.info("[Feishu] publishing inbound message to bus (type=%s, msg_id=%s)", msg_type.value, msg_id)
-                fut = asyncio.run_coroutine_threadsafe(self._prepare_inbound(msg_id, inbound), self._main_loop)
+                # If there's an image, we need to download it first
+                if image_key:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._handle_image_message(msg_id, inbound, image_key), self._main_loop
+                    )
+                else:
+                    fut = asyncio.run_coroutine_threadsafe(self._prepare_inbound(msg_id, inbound), self._main_loop)
                 fut.add_done_callback(lambda f, mid=msg_id: self._log_future_error(f, "prepare_inbound", mid))
             else:
                 logger.warning("[Feishu] main loop not running, cannot publish inbound message")
         except Exception:
             logger.exception("[Feishu] error processing message")
+
+    async def _handle_image_message(self, msg_id: str, inbound, image_key: str) -> None:
+        """Download image and publish inbound message with image data."""
+        image_data = await self._download_image(msg_id, image_key)
+        if image_data:
+            # Generate filename from image key
+            image_filename = f"feishu_{image_key}.jpg"
+            # Store image data in metadata for ChannelManager to handle
+            inbound.metadata["pending_images"] = inbound.metadata.get("pending_images", []) + [
+                {"filename": image_filename, "data": image_data}
+            ]
+            # Inject image path marker into text (will be resolved after thread creation)
+            virtual_path = f"/mnt/user-data/uploads/{image_filename}"
+            if inbound.text:
+                inbound.text = f"{inbound.text}\n\n[图片: {virtual_path}]"
+            else:
+                inbound.text = f"[图片: {virtual_path}]"
+            logger.info("[Feishu] image prepared: %s (%d bytes)", image_filename, len(image_data))
+        else:
+            logger.warning("[Feishu] failed to download image %s", image_key)
+
+        await self._prepare_inbound(msg_id, inbound)

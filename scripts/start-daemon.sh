@@ -73,7 +73,7 @@ trap cleanup_on_failure INT TERM
 mkdir -p logs
 
 echo "Starting LangGraph server..."
-nohup sh -c 'cd backend && NO_COLOR=1 uv run langgraph dev --no-browser --allow-blocking --no-reload > ../logs/langgraph.log 2>&1' &
+nohup sh -c 'export PATH="$HOME/.local/bin:$PATH"; cd backend && NO_COLOR=1 uv run langgraph dev --no-browser --allow-blocking --no-reload > ../logs/langgraph.log 2>&1' &
 ./scripts/wait-for-port.sh 2024 60 "LangGraph" || {
     echo "✗ LangGraph failed to start. Last log output:"
     tail -60 logs/langgraph.log
@@ -87,7 +87,7 @@ nohup sh -c 'cd backend && NO_COLOR=1 uv run langgraph dev --no-browser --allow-
 echo "✓ LangGraph server started on localhost:2024"
 
 echo "Starting Gateway API..."
-nohup sh -c 'cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 > ../logs/gateway.log 2>&1' &
+nohup sh -c 'export PATH="$HOME/.local/bin:$PATH"; cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 > ../logs/gateway.log 2>&1' &
 ./scripts/wait-for-port.sh 8001 30 "Gateway API" || {
     echo "✗ Gateway API failed to start. Last log output:"
     tail -60 logs/gateway.log
@@ -110,13 +110,13 @@ echo "✓ Frontend started on localhost:3000"
 
 echo "Starting Nginx reverse proxy..."
 nohup sh -c 'nginx -g "daemon off;" -c "$1/docker/nginx/nginx.local.conf" -p "$1" > logs/nginx.log 2>&1' _ "$REPO_ROOT" &
-./scripts/wait-for-port.sh 2026 10 "Nginx" || {
+./scripts/wait-for-port.sh 80 10 "Nginx" || {
     echo "✗ Nginx failed to start. Last log output:"
     tail -60 logs/nginx.log
     cleanup_on_failure
     exit 1
 }
-echo "✓ Nginx started on localhost:2026"
+echo "✓ Nginx started on localhost:80"
 
 # ── Ready ─────────────────────────────────────────────────────────────────────
 
@@ -125,9 +125,9 @@ echo "=========================================="
 echo " DeerFlow is running in daemon mode!"
 echo "=========================================="
 echo ""
-echo " 🌐 Application: http://localhost:2026"
-echo " 📡 API Gateway: http://localhost:2026/api/*"
-echo " 🤖 LangGraph: http://localhost:2026/api/langgraph/*"
+echo " 🌐 Application: http://localhost:80"
+echo " 📡 API Gateway: http://localhost:80/api/*"
+echo " 🤖 LangGraph: http://localhost:80/api/langgraph/*"
 echo ""
 echo " 📋 Logs:"
 echo " - LangGraph: logs/langgraph.log"

@@ -231,13 +231,14 @@ class WeixinChannel(Channel):
 
         # WeChat does not render Markdown — strip before sending
         plain_text = _strip_markdown(msg.text)
-        logger.info("[WeChat] sending reply: chat_id=%s, text_len=%d", msg.chat_id, len(plain_text))
+        logger.info("[WeChat] sending reply: chat_id=%s, text_len=%d, attachments=%d", msg.chat_id, len(plain_text), len(msg.attachments))
 
         # Send typing cancel after reply (fire-and-forget)
         typing_ticket = self._typing_ticket_cache.get(msg.chat_id, "")
 
         last_exc: Exception | None = None
         try:
+            # Send text message
             for attempt in range(_max_retries):
                 try:
                     await self._send_text(
@@ -245,7 +246,7 @@ class WeixinChannel(Channel):
                         text=plain_text,
                         context_token=context_token,
                     )
-                    return
+                    break
                 except Exception as exc:
                     last_exc = exc
                     if attempt < _max_retries - 1:
@@ -258,9 +259,21 @@ class WeixinChannel(Channel):
                             exc,
                         )
                         await asyncio.sleep(delay)
+            else:
+                logger.error("[WeChat] send failed after %d attempts: %s", _max_retries, last_exc)
+                raise last_exc  # type: ignore[misc]
 
-            logger.error("[WeChat] send failed after %d attempts: %s", _max_retries, last_exc)
-            raise last_exc  # type: ignore[misc]
+            # Send image attachments if any
+            for attachment in msg.attachments:
+                if attachment.is_image:
+                    try:
+                        await self._send_image(
+                            to_user_id=msg.chat_id,
+                            image_path=attachment.actual_path,
+                            context_token=context_token,
+                        )
+                    except Exception as exc:
+                        logger.warning("[WeChat] failed to send image %s: %s", attachment.filename, exc)
         finally:
             # Always cancel typing indicator — mirrors SDK's processOneMessage finally block
             if typing_ticket:
@@ -339,6 +352,36 @@ class WeixinChannel(Channel):
         except Exception as exc:
             logger.debug("[WeChat] getConfig failed for %s: %s", user_id, exc)
             return {}
+
+    async def _send_image(self, to_user_id: str, image_path: Path, context_token: str) -> None:
+        """Send an image message to a WeChat user.
+
+        Note: WeChat requires images to be uploaded to their CDN first before sending.
+        This is a simplified implementation that logs the attempt. Full implementation
+        would require:
+        1. Upload image to WeChat CDN
+        2. Get filekey and aeskey
+        3. Send image message with CDN reference
+        """
+        logger.info("[WeChat] sending image: to=%s, path=%s", to_user_id, image_path)
+
+        try:
+            # Read image file
+            image_bytes = image_path.read_bytes()
+            if len(image_bytes) > 10 * 1024 * 1024:  # 10MB limit
+                logger.warning("[WeChat] image too large (%d bytes), skipping: %s", len(image_bytes), image_path)
+                return
+
+            # TODO: Implement CDN upload for WeChat
+            # For now, send a text message indicating an image was generated
+            await self._send_text(
+                to_user_id=to_user_id,
+                text=f"[图片: {image_path.name}]",
+                context_token=context_token,
+            )
+            logger.info("[WeChat] image placeholder sent for %s", image_path.name)
+        except Exception:
+            logger.exception("[WeChat] failed to send image")
 
     async def _send_typing(self, user_id: str, typing_ticket: str, status: int) -> None:
         """Send typing indicator to a user (fire-and-forget).
@@ -437,6 +480,78 @@ class WeixinChannel(Channel):
 
         logger.info("[WeChat] poll loop stopped")
 
+    async def _download_weixin_image(self, item: dict[str, Any]) -> bytes | None:
+        """Download image from Weixin CDN and decrypt if needed.
+
+        Args:
+            item: The image item from message's item_list.
+
+        Returns:
+            Image bytes or None if download fails.
+        """
+        image_item = item.get("image_item") or {}
+        media = image_item.get("media") or {}
+        encrypt_query_param = media.get("encrypt_query_param")
+        aes_key = media.get("aes_key")
+        # Alternative: aeskey in hex format
+        aeskey_hex = image_item.get("aeskey")
+
+        if not encrypt_query_param:
+            logger.warning("[WeChat] no encrypt_query_param for image")
+            return None
+
+        try:
+            # Build CDN download URL
+            cdn_url = f"https://cdn.weixin.qq.com/download?encrypted_query_param={encrypt_query_param}"
+
+            # Download from CDN
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(cdn_url)
+                resp.raise_for_status()
+                data = resp.content
+
+            # Decrypt if AES key is available
+            if aeskey_hex and len(aeskey_hex) == 32:
+                # Convert hex aeskey to bytes for AES-128-ECB decryption
+                import hashlib
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+                # aeskey is hex string, need to convert to bytes
+                key_bytes = bytes.fromhex(aeskey_hex)
+                if len(key_bytes) == 16:
+                    cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
+                    decryptor = cipher.decryptor()
+                    decrypted = decryptor.update(data) + decryptor.finalize()
+                    # Remove PKCS7 padding
+                    padding_len = decrypted[-1]
+                    if padding_len <= 16:
+                        decrypted = decrypted[:-padding_len]
+                    return decrypted
+                else:
+                    logger.warning("[WeChat] aeskey length is not 16 bytes: %d", len(key_bytes))
+            elif aes_key:
+                # Try base64 decoded aes_key
+                try:
+                    key_bytes = base64.b64decode(aes_key)
+                    if len(key_bytes) == 16:
+                        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                        cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
+                        decryptor = cipher.decryptor()
+                        decrypted = decryptor.update(data) + decryptor.finalize()
+                        # Remove PKCS7 padding
+                        padding_len = decrypted[-1]
+                        if padding_len <= 16:
+                            decrypted = decrypted[:-padding_len]
+                        return decrypted
+                except Exception as e:
+                    logger.warning("[WeChat] failed to decrypt with aes_key: %s", e)
+
+            # Return as-is if no decryption needed or failed
+            return data
+        except Exception:
+            logger.exception("[WeChat] error downloading/decrypting image")
+            return None
+
     async def _handle_update(self, update: dict[str, Any]) -> None:
         """Process a single update from ilink getupdates."""
         try:
@@ -448,13 +563,36 @@ class WeixinChannel(Channel):
             context_token = update.get("context_token", "")
             item_list = update.get("item_list") or []
 
-            # Extract text (supports plain text, quoted messages, voice-to-text)
-            text = _body_from_item_list(item_list)
+            # Check for image messages
+            image_data = None
+            image_filename = None
+            text = ""
 
-            logger.info("[WeChat] message from user_id=%s, text=%r", from_user_id, text[:100] if text else "")
+            for item in item_list:
+                item_type = item.get("type")
+                if item_type == _IMAGE_TYPE:
+                    # Image message - download and process
+                    logger.info("[WeChat] received image from user_id=%s", from_user_id)
+                    image_data = await self._download_weixin_image(item)
+                    if image_data:
+                        image_filename = f"weixin_{from_user_id}_{int(time.time())}.jpg"
+                    # Continue to check for text in same message
+                elif item_type == _TEXT_TYPE:
+                    # Extract text
+                    text_item = item.get("text_item") or {}
+                    item_text = text_item.get("text", "").strip()
+                    if item_text:
+                        text = item_text
 
+            # If no text extracted, try voice-to-text or fallback
             if not text:
-                logger.debug("[WeChat] empty text update, ignoring")
+                text = _body_from_item_list(item_list)
+
+            logger.info("[WeChat] message from user_id=%s, has_image=%s, text=%r",
+                       from_user_id, bool(image_data), text[:100] if text else "")
+
+            if not text and not image_data:
+                logger.debug("[WeChat] empty text and no image, ignoring")
                 return
 
             # Fetch per-user config for typing_ticket (SDK: WeixinConfigManager.getForUser)
@@ -470,12 +608,40 @@ class WeixinChannel(Channel):
                 if cached_ticket:
                     asyncio.create_task(self._send_typing(from_user_id, cached_ticket, _TYPING_STATUS_TYPING))
 
-            msg_type = InboundMessageType.COMMAND if text.startswith("/") else InboundMessageType.CHAT
+            msg_type = InboundMessageType.COMMAND if (text and text.startswith("/")) else InboundMessageType.CHAT
+
+            # Save image and inject path into text if available
+            if image_data and image_filename:
+                try:
+                    from app.channels.store import ChannelStore
+                    from deerflow.config.paths import get_paths
+
+                    store = ChannelStore()
+                    thread_id = store.get_thread_id("weixin", from_user_id, topic_id=from_user_id)
+
+                    if thread_id:
+                        paths = get_paths()
+                        uploads_dir = paths.sandbox_uploads_dir(thread_id)
+                        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Save image file
+                        image_path = uploads_dir / image_filename
+                        image_path.write_bytes(image_data)
+                        logger.info("[WeChat] saved image to %s (%d bytes)", image_path, len(image_data))
+
+                        # Inject image path into text
+                        virtual_path = f"/mnt/user-data/uploads/{image_filename}"
+                        if text:
+                            text = f"{text}\n\n[图片: {virtual_path}]"
+                        else:
+                            text = f"[图片: {virtual_path}]"
+                except Exception:
+                    logger.exception("[WeChat] failed to save image")
 
             inbound = self._make_inbound(
                 chat_id=from_user_id,
                 user_id=from_user_id,
-                text=text,
+                text=text or "",  # Ensure text is not None
                 msg_type=msg_type,
                 thread_ts=context_token,
                 metadata={"context_token": context_token},
