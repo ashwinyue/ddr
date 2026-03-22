@@ -17,13 +17,16 @@ from deerflow.subagents.executor import SubagentStatus, cleanup_background_task,
 
 logger = logging.getLogger(__name__)
 
+# Subagent types that use ClaudeCodeExecutor instead of SubagentExecutor
+_CLAUDE_CODE_TYPES = {"claude-code"}
+
 
 @tool("task", parse_docstring=True)
 def task_tool(
     runtime: ToolRuntime[ContextT, ThreadState],
     description: str,
     prompt: str,
-    subagent_type: Literal["general-purpose", "bash"],
+    subagent_type: Literal["general-purpose", "bash", "claude-code"],
     tool_call_id: Annotated[str, InjectedToolCallId],
     max_turns: int | None = None,
 ) -> str:
@@ -40,6 +43,10 @@ def task_tool(
       multiple dependent steps, or would benefit from isolated context.
     - **bash**: Command execution specialist for running bash commands. Use for
       git operations, build processes, or when command output would be verbose.
+    - **claude-code**: Claude Code CLI specialist for software engineering tasks.
+      Use when writing new code, implementing features, modifying source files,
+      debugging, refactoring, or any task where the primary deliverable is working
+      code in the filesystem. Requires the `claude` CLI to be installed.
 
     When to use this tool:
     - Complex tasks requiring multiple steps or tools
@@ -60,7 +67,7 @@ def task_tool(
     # Get subagent configuration
     config = get_subagent_config(subagent_type)
     if config is None:
-        return f"Error: Unknown subagent type '{subagent_type}'. Available: general-purpose, bash"
+        return f"Error: Unknown subagent type '{subagent_type}'. Available: general-purpose, bash, claude-code"
 
     # Build config overrides
     overrides: dict = {}
@@ -93,6 +100,21 @@ def task_tool(
 
         # Get or generate trace_id for distributed tracing
         trace_id = metadata.get("trace_id") or str(uuid.uuid4())[:8]
+
+    # Route to ClaudeCodeExecutor for claude-code subagent type
+    if subagent_type in _CLAUDE_CODE_TYPES:
+        # Read verbose flag: channel-level setting (via configurable) takes priority over config.yaml
+        configurable = runtime.config.get("configurable", {}) if runtime else {}
+        verbose_override = configurable.get("claude_code_verbose")
+        return _run_claude_code(
+            prompt=prompt,
+            description=description,
+            config=config,
+            task_id=tool_call_id,
+            trace_id=trace_id,
+            work_dir="/",
+            verbose_override=verbose_override,
+        )
 
     # Get available tools (excluding task tool to prevent nesting)
     # Lazy import to avoid circular dependency
@@ -193,3 +215,97 @@ def task_tool(
             logger.error(f"[trace={trace_id}] Task {task_id} polling timed out after {poll_count} polls (should have been caught by thread pool timeout)")
             writer({"type": "task_timed_out", "task_id": task_id})
             return f"Task polling timed out after {timeout_minutes} minutes. This may indicate the background task is stuck. Status: {result.status.value}"
+
+
+def _run_claude_code(
+    prompt: str,
+    description: str,
+    config,
+    task_id: str,
+    trace_id: str | None,
+    work_dir: str,
+    verbose_override: bool | None = None,
+) -> str:
+    """Execute a task via ClaudeCodeExecutor with streaming events.
+
+    Runs synchronously in the current thread (Claude Code manages its own
+    concurrency internally). Streams verbose events via LangGraph stream writer.
+
+    verbose priority: channel /verbose command > config.yaml > False (default)
+    """
+    from deerflow.subagents.claude_code_executor import ClaudeCodeExecutor, is_claude_available
+
+    writer = get_stream_writer()
+    writer({"type": "task_started", "task_id": task_id, "description": description})
+
+    if not is_claude_available():
+        msg = "claude CLI not found in PATH. Install Claude Code first."
+        writer({"type": "task_failed", "task_id": task_id, "error": msg})
+        return f"Task failed. Error: {msg}"
+
+    # verbose priority: channel setting (from /verbose command) > config.yaml > False
+    verbose = verbose_override if verbose_override is not None else _get_claude_code_verbose()
+
+    logger.info("[trace=%s] Starting claude-code task (verbose=%s): %s", trace_id, verbose, description)
+
+    def _on_event(event: dict) -> None:
+        """Forward verbose events to the stream writer."""
+        event_type = event.get("type", "")
+        if event_type == "claude_code_tool_use":
+            writer({
+                "type": "task_running",
+                "task_id": task_id,
+                "message": {"role": "assistant", "content": f"🔧 {event['summary']}"},
+                "message_index": 0,
+                "total_messages": 0,
+            })
+        elif event_type == "claude_code_tool_result":
+            status_icon = "❌" if event.get("is_error") else "✅"
+            writer({
+                "type": "task_running",
+                "task_id": task_id,
+                "message": {"role": "assistant", "content": f"{status_icon} {event['content']}"},
+                "message_index": 0,
+                "total_messages": 0,
+            })
+        elif event_type == "claude_code_thinking":
+            writer({
+                "type": "task_running",
+                "task_id": task_id,
+                "message": {"role": "assistant", "content": f"💭 {event['content']}"},
+                "message_index": 0,
+                "total_messages": 0,
+            })
+
+    executor = ClaudeCodeExecutor(
+        config=config,
+        work_dir=work_dir,
+        verbose=verbose,
+        trace_id=trace_id,
+    )
+
+    result = executor.execute(prompt, on_event=_on_event if verbose else None)
+
+    if result.status == SubagentStatus.COMPLETED:
+        writer({"type": "task_completed", "task_id": task_id, "result": result.result})
+        return f"Task Succeeded. Result: {result.result}"
+    else:
+        error = result.error or "Unknown error"
+        writer({"type": "task_failed", "task_id": task_id, "error": error})
+        return f"Task failed. Error: {error}"
+
+
+def _get_claude_code_verbose() -> bool:
+    """Read verbose flag from config.yaml subagents.claude_code.verbose (default: False)."""
+    try:
+        from deerflow.config import get_app_config
+        cfg = get_app_config()
+        subagents_cfg = getattr(cfg, "subagents", None)
+        if subagents_cfg is None:
+            return False
+        claude_code_cfg = getattr(subagents_cfg, "claude_code", None)
+        if claude_code_cfg is None:
+            return False
+        return bool(getattr(claude_code_cfg, "verbose", False))
+    except Exception:
+        return False

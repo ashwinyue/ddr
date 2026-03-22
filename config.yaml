@@ -448,7 +448,7 @@ channels:
     context:
       thinking_enabled: true
       is_plan_mode: false
-      subagent_enabled: false
+      subagent_enabled: true
 
   feishu:
     enabled: true
