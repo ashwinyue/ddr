@@ -4,6 +4,7 @@ import { useCallback } from "react";
 
 import { type PromptInputMessage } from "@/components/ai-elements/prompt-input";
 import { ArtifactTrigger } from "@/components/workspace/artifacts";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import {
   ChatBox,
   useSpecificChatMode,
@@ -81,6 +82,7 @@ export default function ChatPage() {
                 : "bg-background/80 shadow-xs backdrop-blur",
             )}
           >
+            <SidebarTrigger className="mr-2 shrink-0 md:hidden" />
             <div className="flex w-full items-center text-sm font-medium">
               <ThreadTitle threadId={threadId} thread={thread} />
             </div>

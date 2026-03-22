@@ -6,6 +6,7 @@ import { useCallback } from "react";
 
 import type { PromptInputMessage } from "@/components/ai-elements/prompt-input";
 import { Button } from "@/components/ui/button";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AgentWelcome } from "@/components/workspace/agent-welcome";
 import { ArtifactTrigger } from "@/components/workspace/artifacts";
 import { ChatBox, useThreadChat } from "@/components/workspace/chats";
@@ -91,6 +92,7 @@ export default function AgentChatPage() {
                 : "bg-background/80 shadow-xs backdrop-blur",
             )}
           >
+            <SidebarTrigger className="mr-1 shrink-0 md:hidden" />
             {/* Agent badge */}
             <div className="flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1">
               <BotIcon className="text-primary h-3.5 w-3.5" />
