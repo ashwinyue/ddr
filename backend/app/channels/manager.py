@@ -541,7 +541,7 @@ class ChannelManager:
         await self._handle_pending_images(msg, thread_id)
 
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-        if msg.channel_name == "feishu":
+        if msg.channel_name in ("feishu", "weixin"):
             await self._handle_streaming_chat(
                 client,
                 msg,

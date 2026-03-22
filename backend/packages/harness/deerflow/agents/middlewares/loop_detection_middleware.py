@@ -21,7 +21,7 @@ from typing import override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
@@ -203,8 +203,11 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             return {"messages": [stripped_msg]}
 
         if warning:
-            # Inject a system message warning the model
-            return {"messages": [SystemMessage(content=warning)]}
+            # Use HumanMessage instead of SystemMessage to avoid
+            # "multiple non-consecutive system messages" error when
+            # the warning is persisted by checkpointer and the next
+            # run injects a fresh system prompt at position 0.
+            return {"messages": [HumanMessage(content=f"[NOTICE] {warning}")]}
 
         return None
 

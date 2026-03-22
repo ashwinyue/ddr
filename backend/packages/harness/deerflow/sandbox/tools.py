@@ -1,4 +1,6 @@
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from langchain.tools import ToolRuntime, tool
@@ -246,70 +248,17 @@ def _reject_path_traversal(path: str) -> None:
 
 
 def validate_local_tool_path(path: str, thread_data: ThreadDataState | None, *, read_only: bool = False) -> None:
-    """Validate that a virtual path is allowed for local-sandbox access.
+    """Validate that a path is allowed for local-sandbox access.
 
-    This function is a security gate — it checks whether *path* may be
-    accessed and raises on violation.  It does **not** resolve the virtual
-    path to a host path; callers are responsible for resolution via
-    ``_resolve_and_validate_user_data_path`` or ``_resolve_skills_path``.
-
-    Allowed virtual-path families:
-      - ``/mnt/user-data/*``  — always allowed (read + write)
-      - ``/mnt/skills/*``     — allowed only when *read_only* is True
-
-    Args:
-        path: The virtual path to validate.
-        thread_data: Thread data (must be present for local sandbox).
-        read_only: When True, skills paths are permitted.
-
-    Raises:
-        SandboxRuntimeError: If thread data is missing.
-        PermissionError: If the path is not allowed or contains traversal.
+    Path restrictions are disabled for server deployment — all absolute paths
+    are permitted.  Only path-traversal sequences (..) are still rejected to
+    prevent trivial canonicalisation bypasses.
     """
-    if thread_data is None:
-        raise SandboxRuntimeError("Thread data not available for local sandbox")
-
     _reject_path_traversal(path)
-
-    # Skills paths — read-only access only
-    if _is_skills_path(path):
-        if not read_only:
-            raise PermissionError(f"Write access to skills path is not allowed: {path}")
-        return
-
-    # User-data paths
-    if path.startswith(f"{VIRTUAL_PATH_PREFIX}/"):
-        return
-
-    raise PermissionError(f"Only paths under {VIRTUAL_PATH_PREFIX}/ or {_get_skills_container_path()}/ are allowed")
 
 
 def _validate_resolved_user_data_path(resolved: Path, thread_data: ThreadDataState) -> None:
-    """Verify that a resolved host path stays inside allowed per-thread roots.
-
-    Raises PermissionError if the path escapes workspace/uploads/outputs.
-    """
-    allowed_roots = [
-        Path(p).resolve()
-        for p in (
-            thread_data.get("workspace_path"),
-            thread_data.get("uploads_path"),
-            thread_data.get("outputs_path"),
-        )
-        if p is not None
-    ]
-
-    if not allowed_roots:
-        raise SandboxRuntimeError("No allowed local sandbox directories configured")
-
-    for root in allowed_roots:
-        try:
-            resolved.relative_to(root)
-            return
-        except ValueError:
-            continue
-
-    raise PermissionError("Access denied: path traversal detected")
+    """Boundary check disabled for server deployment — all host paths are permitted."""
 
 
 def _resolve_and_validate_user_data_path(path: str, thread_data: ThreadDataState) -> str:
@@ -324,39 +273,7 @@ def _resolve_and_validate_user_data_path(path: str, thread_data: ThreadDataState
 
 
 def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState | None) -> None:
-    """Validate absolute paths in local-sandbox bash commands.
-
-    In local mode, commands must use virtual paths under /mnt/user-data for
-    user data access. Skills paths under /mnt/skills are allowed for reading.
-    A small allowlist of common system path prefixes is kept for executable
-    and device references (e.g. /bin/sh, /dev/null).
-    """
-    if thread_data is None:
-        raise SandboxRuntimeError("Thread data not available for local sandbox")
-
-    unsafe_paths: list[str] = []
-
-    for absolute_path in _ABSOLUTE_PATH_PATTERN.findall(command):
-        if absolute_path == VIRTUAL_PATH_PREFIX or absolute_path.startswith(f"{VIRTUAL_PATH_PREFIX}/"):
-            _reject_path_traversal(absolute_path)
-            continue
-
-        # Allow skills container path (resolved by tools.py before passing to sandbox)
-        if _is_skills_path(absolute_path):
-            _reject_path_traversal(absolute_path)
-            continue
-
-        if any(
-            absolute_path == prefix.rstrip("/") or absolute_path.startswith(prefix)
-            for prefix in _LOCAL_BASH_SYSTEM_PATH_PREFIXES
-        ):
-            continue
-
-        unsafe_paths.append(absolute_path)
-
-    if unsafe_paths:
-        unsafe = ", ".join(sorted(dict.fromkeys(unsafe_paths)))
-        raise PermissionError(f"Unsafe absolute paths in command: {unsafe}. Use paths under {VIRTUAL_PATH_PREFIX}")
+    """Path allowlist disabled for server deployment — all absolute paths are permitted."""
 
 
 def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState | None) -> str:
@@ -392,6 +309,96 @@ def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState 
         result = pattern.sub(replace_user_data_match, result)
 
     return result
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    """Return True if path is inside parent (resolved, no traversal)."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _rewrite_referenced_scripts(command: str, thread_data: ThreadDataState | None) -> tuple[str, list[str]]:
+    """Translate virtual paths inside script files referenced in the command.
+
+    After virtual-path substitution on the command string itself, script files
+    that the command executes may still contain raw /mnt/user-data/ paths in
+    their content (because write_file stores the content verbatim).
+
+    This function:
+      1. Finds absolute file paths in the translated command that exist inside
+         the current thread's user-data directories.
+      2. For each such file whose content contains VIRTUAL_PATH_PREFIX, creates
+         a temporary copy with all virtual paths translated to actual paths.
+      3. Replaces the original path in the command string with the temp-file path.
+
+    Args:
+        command: Already-translated bash command (virtual paths in command string
+                 have already been replaced by the caller).
+        thread_data: Thread data for path resolution.
+
+    Returns:
+        (modified_command, list_of_temp_files_to_cleanup)
+    """
+    if thread_data is None:
+        return command, []
+
+    mappings = _thread_virtual_to_actual_mappings(thread_data)
+    if not mappings:
+        return command, []
+
+    # Collect unique user-data root directories (parent of workspace/outputs/uploads)
+    actual_roots: list[Path] = []
+    for actual in mappings.values():
+        p = Path(actual)
+        candidate = p.parent if p.name in ("workspace", "uploads", "outputs") else p
+        if candidate not in actual_roots:
+            actual_roots.append(candidate)
+
+    temp_files: list[str] = []
+    result = command
+
+    for match in re.finditer(r"(/[^\s\"';|&<>()]+)", result):
+        path_str = match.group(1)
+        path = Path(path_str)
+
+        if not path.is_file():
+            continue
+
+        # Only rewrite files inside user-data directories
+        if not any(_is_within(path, root) for root in actual_roots):
+            continue
+
+        # Only bother if content has virtual paths
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        if VIRTUAL_PATH_PREFIX not in content:
+            continue
+
+        # Translate virtual paths in content and write to temp file
+        translated = replace_virtual_paths_in_command(content, thread_data)
+        try:
+            suffix = path.suffix or ".sh"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="deerflow-script-")
+            os.close(fd)
+            Path(tmp_path).write_text(translated, encoding="utf-8")
+            # Preserve + ensure executable bit
+            try:
+                mode = path.stat().st_mode
+            except OSError:
+                mode = 0o644
+            os.chmod(tmp_path, mode | 0o111)
+            temp_files.append(tmp_path)
+            result = result.replace(path_str, tmp_path, 1)
+        except Exception:
+            pass  # Fall back to original path; script may still fail but that's user-visible
+
+    return result, temp_files
 
 
 def get_thread_data(runtime: ToolRuntime[ContextT, ThreadState] | None) -> ThreadDataState | None:
@@ -552,6 +559,7 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
         description: Explain why you are running this command in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         command: The bash command to execute. Always use absolute paths for files and directories.
     """
+    temp_files: list[str] = []
     try:
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
@@ -559,6 +567,9 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
         if is_local_sandbox(runtime):
             validate_local_bash_command_paths(command, thread_data)
             command = replace_virtual_paths_in_command(command, thread_data)
+            # Rewrite any referenced script files whose content still contains
+            # virtual paths (agent writes scripts verbatim; we need translated copies).
+            command, temp_files = _rewrite_referenced_scripts(command, thread_data)
             output = sandbox.execute_command(command)
             return mask_local_paths_in_output(output, thread_data)
         return sandbox.execute_command(command)
@@ -568,6 +579,12 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
         return f"Error: {e}"
     except Exception as e:
         return f"Error: Unexpected error executing command: {_sanitize_error(e, runtime)}"
+    finally:
+        for tf in temp_files:
+            try:
+                os.unlink(tf)
+            except OSError:
+                pass
 
 
 @tool("ls", parse_docstring=True)

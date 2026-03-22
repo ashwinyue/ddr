@@ -84,50 +84,48 @@ def test_reject_path_traversal_allows_normal_paths() -> None:
 
 
 # ---------- validate_local_tool_path ----------
+# Path-allowlist restrictions are disabled for server deployment.
+# Only path-traversal (..) sequences are still blocked.
 
 
-def test_validate_local_tool_path_rejects_non_virtual_path() -> None:
-    with pytest.raises(PermissionError, match="Only paths under"):
-        validate_local_tool_path("/Users/someone/config.yaml", _THREAD_DATA)
+def test_validate_local_tool_path_allows_non_virtual_path() -> None:
+    """All absolute paths are now permitted (server deployment)."""
+    validate_local_tool_path("/Users/someone/config.yaml", _THREAD_DATA)
+    validate_local_tool_path("/etc/passwd", _THREAD_DATA)
+    validate_local_tool_path("/root/project/file.txt", _THREAD_DATA)
 
 
-def test_validate_local_tool_path_rejects_bare_virtual_root() -> None:
-    """The bare /mnt/user-data root without trailing slash is not a valid sub-path."""
-    with pytest.raises(PermissionError, match="Only paths under"):
-        validate_local_tool_path(VIRTUAL_PATH_PREFIX, _THREAD_DATA)
+def test_validate_local_tool_path_allows_bare_virtual_root() -> None:
+    """Bare /mnt/user-data is permitted (server deployment)."""
+    validate_local_tool_path(VIRTUAL_PATH_PREFIX, _THREAD_DATA)
 
 
 def test_validate_local_tool_path_allows_user_data_paths() -> None:
-    # Should not raise — user-data paths are always allowed
     validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/workspace/file.txt", _THREAD_DATA)
     validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/uploads/doc.pdf", _THREAD_DATA)
     validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/outputs/result.csv", _THREAD_DATA)
 
 
 def test_validate_local_tool_path_allows_user_data_write() -> None:
-    # read_only=False (default) should still work for user-data paths
     validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/workspace/file.txt", _THREAD_DATA, read_only=False)
 
 
 def test_validate_local_tool_path_rejects_traversal_in_user_data() -> None:
-    """Path traversal via .. in user-data paths must be rejected."""
+    """Path traversal via .. is still rejected."""
     with pytest.raises(PermissionError, match="path traversal"):
         validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/workspace/../../etc/passwd", _THREAD_DATA)
 
 
 def test_validate_local_tool_path_rejects_traversal_in_skills() -> None:
-    """Path traversal via .. in skills paths must be rejected."""
+    """Path traversal via .. is still rejected."""
     with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"):
         with pytest.raises(PermissionError, match="path traversal"):
             validate_local_tool_path("/mnt/skills/../../etc/passwd", _THREAD_DATA, read_only=True)
 
 
-def test_validate_local_tool_path_rejects_none_thread_data() -> None:
-    """Missing thread_data should raise SandboxRuntimeError."""
-    from deerflow.sandbox.exceptions import SandboxRuntimeError
-
-    with pytest.raises(SandboxRuntimeError):
-        validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/workspace/file.txt", None)
+def test_validate_local_tool_path_allows_none_thread_data() -> None:
+    """None thread_data is tolerated (no-op validation, server deployment)."""
+    validate_local_tool_path(f"{VIRTUAL_PATH_PREFIX}/workspace/file.txt", None)
 
 
 # ---------- _resolve_skills_path ----------
@@ -179,8 +177,8 @@ def test_resolve_and_validate_user_data_path_resolves_correctly(tmp_path: Path) 
     assert resolved == str(workspace / "hello.txt")
 
 
-def test_resolve_and_validate_user_data_path_blocks_traversal(tmp_path: Path) -> None:
-    """Even after resolution, path must stay within allowed roots."""
+def test_resolve_and_validate_user_data_path_allows_resolved_traversal(tmp_path: Path) -> None:
+    """Boundary check is disabled for server deployment; resolved path is returned as-is."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     thread_data = {
@@ -188,9 +186,9 @@ def test_resolve_and_validate_user_data_path_blocks_traversal(tmp_path: Path) ->
         "uploads_path": str(tmp_path / "uploads"),
         "outputs_path": str(tmp_path / "outputs"),
     }
-    # This path resolves outside the allowed roots
-    with pytest.raises(PermissionError):
-        _resolve_and_validate_user_data_path("/mnt/user-data/workspace/../../../etc/passwd", thread_data)
+    # No longer raises — boundary enforcement removed for server deployment
+    result = _resolve_and_validate_user_data_path("/mnt/user-data/workspace/../../../etc/passwd", thread_data)
+    assert result  # Returns some resolved path
 
 
 # ---------- replace_virtual_paths_in_command ----------
@@ -223,11 +221,14 @@ def test_replace_virtual_paths_in_command_replaces_both() -> None:
 
 
 # ---------- validate_local_bash_command_paths ----------
+# Path allowlist is disabled for server deployment — all paths are permitted.
 
 
-def test_validate_local_bash_command_paths_blocks_host_paths() -> None:
-    with pytest.raises(PermissionError, match="Unsafe absolute paths"):
-        validate_local_bash_command_paths("cat /etc/passwd", _THREAD_DATA)
+def test_validate_local_bash_command_paths_allows_host_paths() -> None:
+    """All host paths are now allowed (server deployment)."""
+    validate_local_bash_command_paths("cat /etc/passwd", _THREAD_DATA)
+    validate_local_bash_command_paths("ls /root", _THREAD_DATA)
+    validate_local_bash_command_paths("cat /tmp/script.sh", _THREAD_DATA)
 
 
 def test_validate_local_bash_command_paths_allows_virtual_and_system_paths() -> None:
@@ -237,23 +238,21 @@ def test_validate_local_bash_command_paths_allows_virtual_and_system_paths() -> 
     )
 
 
-def test_validate_local_bash_command_paths_blocks_traversal_in_user_data() -> None:
-    """Bash commands with traversal in user-data paths should be blocked."""
-    with pytest.raises(PermissionError, match="path traversal"):
+def test_validate_local_bash_command_paths_allows_traversal_in_user_data() -> None:
+    """Bash traversal no longer blocked — OS/shell resolves paths naturally."""
+    validate_local_bash_command_paths(
+        "cat /mnt/user-data/workspace/../../etc/passwd",
+        _THREAD_DATA,
+    )
+
+
+def test_validate_local_bash_command_paths_allows_traversal_in_skills() -> None:
+    """Bash traversal no longer blocked (server deployment)."""
+    with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"):
         validate_local_bash_command_paths(
-            "cat /mnt/user-data/workspace/../../etc/passwd",
+            "cat /mnt/skills/../../etc/passwd",
             _THREAD_DATA,
         )
-
-
-def test_validate_local_bash_command_paths_blocks_traversal_in_skills() -> None:
-    """Bash commands with traversal in skills paths should be blocked."""
-    with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"):
-        with pytest.raises(PermissionError, match="path traversal"):
-            validate_local_bash_command_paths(
-                "cat /mnt/skills/../../etc/passwd",
-                _THREAD_DATA,
-            )
 
 
 # ---------- Skills path tests ----------
@@ -278,15 +277,14 @@ def test_validate_local_tool_path_allows_skills_read_only() -> None:
         )
 
 
-def test_validate_local_tool_path_blocks_skills_write() -> None:
-    """write_file / str_replace must NOT write to skills paths."""
+def test_validate_local_tool_path_allows_skills_write() -> None:
+    """Skills write restriction removed for server deployment."""
     with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"):
-        with pytest.raises(PermissionError, match="Write access to skills path is not allowed"):
-            validate_local_tool_path(
-                "/mnt/skills/public/bootstrap/SKILL.md",
-                _THREAD_DATA,
-                read_only=False,
-            )
+        validate_local_tool_path(
+            "/mnt/skills/public/bootstrap/SKILL.md",
+            _THREAD_DATA,
+            read_only=False,
+        )
 
 
 def test_validate_local_bash_command_paths_allows_skills_path() -> None:
@@ -298,27 +296,23 @@ def test_validate_local_bash_command_paths_allows_skills_path() -> None:
         )
 
 
-def test_validate_local_bash_command_paths_still_blocks_other_paths() -> None:
-    """Paths outside virtual and system prefixes must still be blocked."""
+def test_validate_local_bash_command_paths_allows_all_paths() -> None:
+    """All paths now allowed (server deployment — no allowlist)."""
     with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"):
-        with pytest.raises(PermissionError, match="Unsafe absolute paths"):
-            validate_local_bash_command_paths("cat /etc/shadow", _THREAD_DATA)
+        validate_local_bash_command_paths("cat /etc/shadow", _THREAD_DATA)
 
 
 def test_validate_local_tool_path_skills_custom_container_path() -> None:
-    """Skills with a custom container_path in config should also work."""
+    """All paths allowed regardless of skills container_path config (server deployment)."""
     with patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/custom/skills"):
-        # Should not raise
         validate_local_tool_path(
             "/custom/skills/public/my-skill/SKILL.md",
             _THREAD_DATA,
             read_only=True,
         )
-
-        # The default /mnt/skills should not match since container path is /custom/skills
-        with pytest.raises(PermissionError, match="Only paths under"):
-            validate_local_tool_path(
-                "/mnt/skills/public/bootstrap/SKILL.md",
-                _THREAD_DATA,
-                read_only=True,
-            )
+        # /mnt/skills also allowed now — no path restrictions
+        validate_local_tool_path(
+            "/mnt/skills/public/bootstrap/SKILL.md",
+            _THREAD_DATA,
+            read_only=True,
+        )

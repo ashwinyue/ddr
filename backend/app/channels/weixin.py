@@ -19,7 +19,7 @@ from urllib.parse import quote as url_quote
 import httpx
 
 from app.channels.base import Channel
-from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage
+from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,10 @@ _BACKOFF_DELAY = 30       # seconds after MAX_CONSECUTIVE_FAILURES
 _MAX_CONSECUTIVE_FAILURES = 3
 _SESSION_PAUSE_SECONDS = 3600  # 1 hour — errcode -14 session expired
 _SESSION_EXPIRED_ERRCODE = -14
+# Streaming: minimum new chars before sending an intermediate chunk to WeChat.
+# WeChat cannot edit messages, so each update is a new message; keep chunks
+# large enough to be readable but small enough to feel responsive.
+_WEIXIN_STREAM_MIN_DELTA = 80
 
 _TEXT_TYPE = 1            # MessageItemType.TEXT
 _IMAGE_TYPE = 2           # MessageItemType.IMAGE
@@ -175,6 +179,9 @@ class WeixinChannel(Channel):
         self._session_paused_until: float = 0.0
         # Per-user typing ticket cache: user_id → typing_ticket
         self._typing_ticket_cache: dict[str, str] = {}
+        # Streaming state: tracks how much text has already been sent as intermediate
+        # chunks for the current in-flight response (keyed by user_id / chat_id).
+        self._stream_sent_text: dict[str, str] = {}
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -249,6 +256,22 @@ class WeixinChannel(Channel):
 
     # -- outbound -------------------------------------------------------------
 
+    async def _send_text_with_retry(self, user_id: str, text: str, context_token: str, max_retries: int = 3) -> None:
+        """Send a text message with exponential-backoff retry."""
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                await self._send_text(to_user_id=user_id, text=text, context_token=context_token)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    delay = 2**attempt
+                    logger.warning("[WeChat] send failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, delay, exc)
+                    await asyncio.sleep(delay)
+        logger.error("[WeChat] send failed after %d attempts: %s", max_retries, last_exc)
+        raise last_exc  # type: ignore[misc]
+
     async def send(self, msg: OutboundMessage, *, _max_retries: int = 3) -> None:
         context_token = msg.metadata.get("context_token", "")
         if not context_token:
@@ -257,37 +280,34 @@ class WeixinChannel(Channel):
 
         # WeChat does not render Markdown — strip before sending
         plain_text = _strip_markdown(msg.text)
-        logger.info("[WeChat] sending reply: chat_id=%s, text_len=%d, attachments=%d", msg.chat_id, len(plain_text), len(msg.attachments))
 
-        # Send typing cancel after reply (fire-and-forget)
+        # --- Streaming intermediate chunk (is_final=False) ---
+        # WeChat cannot edit messages, so each update is a new message.
+        # Only send when the new delta is large enough to be readable.
+        if not msg.is_final:
+            last_sent = self._stream_sent_text.get(msg.chat_id, "")
+            delta = plain_text[len(last_sent):]
+            if len(delta) < _WEIXIN_STREAM_MIN_DELTA:
+                return  # not enough new content yet
+            logger.info("[WeChat] streaming chunk: chat_id=%s, delta_len=%d", msg.chat_id, len(delta))
+            try:
+                await self._send_text_with_retry(msg.chat_id, delta, context_token, _max_retries)
+                self._stream_sent_text[msg.chat_id] = plain_text
+            except Exception:
+                logger.exception("[WeChat] failed to send streaming chunk for chat_id=%s", msg.chat_id)
+            return
+
+        # --- Final message (is_final=True) ---
+        # Send the remaining delta (text not yet sent as intermediate chunks),
+        # then send any attachments, then cancel the typing indicator.
         typing_ticket = self._typing_ticket_cache.get(msg.chat_id, "")
+        last_sent = self._stream_sent_text.pop(msg.chat_id, "")
+        remaining = plain_text[len(last_sent):]
 
-        last_exc: Exception | None = None
+        logger.info("[WeChat] final reply: chat_id=%s, remaining_len=%d, attachments=%d", msg.chat_id, len(remaining), len(msg.attachments))
         try:
-            # Send text message
-            for attempt in range(_max_retries):
-                try:
-                    await self._send_text(
-                        to_user_id=msg.chat_id,
-                        text=plain_text,
-                        context_token=context_token,
-                    )
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < _max_retries - 1:
-                        delay = 2**attempt
-                        logger.warning(
-                            "[WeChat] send failed (attempt %d/%d), retrying in %ds: %s",
-                            attempt + 1,
-                            _max_retries,
-                            delay,
-                            exc,
-                        )
-                        await asyncio.sleep(delay)
-            else:
-                logger.error("[WeChat] send failed after %d attempts: %s", _max_retries, last_exc)
-                raise last_exc  # type: ignore[misc]
+            if remaining.strip():
+                await self._send_text_with_retry(msg.chat_id, remaining, context_token, _max_retries)
 
             # Send attachments (images and files)
             for attachment in msg.attachments:
@@ -299,7 +319,6 @@ class WeixinChannel(Channel):
                             context_token=context_token,
                         )
                     else:
-                        # Send as file attachment (PDF, ZIP, DOC, etc.)
                         await self._send_file(
                             to_user_id=msg.chat_id,
                             file_path=attachment.actual_path,
@@ -312,6 +331,10 @@ class WeixinChannel(Channel):
             # Always cancel typing indicator — mirrors SDK's processOneMessage finally block
             if typing_ticket:
                 asyncio.create_task(self._send_typing(msg.chat_id, typing_ticket, _TYPING_STATUS_CANCEL))
+
+    async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
+        """Return True so base._on_outbound() knows files are handled inside send()."""
+        return True
 
     # -- ilink API ------------------------------------------------------------
 
@@ -542,7 +565,8 @@ class WeixinChannel(Channel):
                                 "file_item": {
                                     "media": {
                                         "encrypt_query_param": download_param,
-                                        "aes_key": base64.b64encode(aes_key).decode(),
+                                        # base64(hex_string) — same as _send_image and weixin-agent-sdk
+                                        "aes_key": base64.b64encode(aes_key.hex().encode()).decode(),
                                         "encrypt_type": 1,
                                     },
                                     "file_name": file_name,
